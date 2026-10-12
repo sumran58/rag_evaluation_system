@@ -7,7 +7,10 @@ authors = [
     { name = "Sumran Harchirkar", email = "sumranharchirkar58@gmail.com" }
 ]
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "dotenv>=0.9.9",
+    "pymupdf>=1.28.2",
+]
 
 [project.scripts]
 rag-evaluation-system = "rag_evaluation_system:main"
