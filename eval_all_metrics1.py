@@ -1,191 +1,315 @@
 
-import json
 import os
+import json
+import time
+import asyncio
+import random
+from pathlib import Path
 
+from dotenv import load_dotenv
+from groq import RateLimitError
 from langchain_groq import ChatGroq
+
+from deepeval import evaluate
 from deepeval.models import DeepEvalBaseLLM
 from deepeval.metrics import (
     AnswerRelevancyMetric,
     FaithfulnessMetric,
     ContextualRelevancyMetric,
-    GEval
+    GEval,
 )
-from deepeval.test_case import LLMTestCase, SingleTurnParams
+from deepeval.test_case import LLMTestCase, LLMTestCaseParams
 from deepeval.evaluate import CacheConfig
-from deepeval import evaluate
 
 
-# 1. Configure ChatGroq
+# --------------------------------------------------
+# 1. Configuration
+# --------------------------------------------------
+
+load_dotenv()
+
+INPUT_FILE = Path("result1.jsonl")
+OUTPUT_FILE = Path("evaluated_results1.jsonl")
+
+BATCH_SIZE = 1
+MAX_ATTEMPTS = 6
+
+if not os.getenv("GROQ_API_KEY"):
+    raise ValueError(
+        "GROQ_API_KEY not found. Add it to your .env file."
+    )
+
+
+# --------------------------------------------------
+# 2. Initialize Groq
+# --------------------------------------------------
+
 groq_model = ChatGroq(
-    model="openai/gpt-oss-120b",
+    model="openai/gpt-oss-20b",
     temperature=0,
-    api_key=os.getenv("GROQ_API_KEY")
+    max_retries=0,
 )
 
+# Shared lock: serialize calls made through this wrapper.
+groq_request_lock = asyncio.Lock()
 
-# 2. Create a custom DeepEval model wrapper
+
+# --------------------------------------------------
+# 3. DeepEval model wrapper with retry handling
+# --------------------------------------------------
+
 class GroqEvalModel(DeepEvalBaseLLM):
 
-    def __init__(self, model):
+    def __init__(self, model, max_attempts=6):
         self.model = model
+        self.max_attempts = max_attempts
 
     def load_model(self):
         return self.model
 
     def generate(self, prompt: str) -> str:
-        response = self.model.invoke(prompt)
-        return response.content
+        for attempt in range(self.max_attempts):
+            try:
+                response = self.model.invoke(prompt)
+                return response.content
+
+            except RateLimitError:
+                if attempt == self.max_attempts - 1:
+                    raise
+
+                delay = min(5 * (2 ** attempt), 60)
+                delay += random.uniform(0, 2)
+
+                print(
+                    f"Groq rate limit reached. "
+                    f"Retrying in {delay:.1f} seconds..."
+                )
+                time.sleep(delay)
+
+        raise RuntimeError("Groq retry attempts exhausted")
 
     async def a_generate(self, prompt: str) -> str:
-        response = await self.model.ainvoke(prompt)
-        return response.content
+        for attempt in range(self.max_attempts):
+            try:
+                # Prevent overlapping requests through this wrapper.
+                async with groq_request_lock:
+                    response = await self.model.ainvoke(prompt)
+
+                return response.content
+
+            except RateLimitError:
+                if attempt == self.max_attempts - 1:
+                    raise
+
+                delay = min(5 * (2 ** attempt), 60)
+                delay += random.uniform(0, 2)
+
+                print(
+                    f"Groq rate limit reached. "
+                    f"Retrying in {delay:.1f} seconds..."
+                )
+                await asyncio.sleep(delay)
+
+        raise RuntimeError("Groq retry attempts exhausted")
 
     def get_model_name(self):
-        return "Groq GPT OSS 120B"
+        return "Groq GPT OSS 20B"
 
 
-evaluation_model = GroqEvalModel(groq_model)
+groq_eval_model = GroqEvalModel(groq_model)
 
 
-# 3. Load the original results
-with open("result1.jsonl", "r", encoding="utf-8") as file:
-    results = [
-        json.loads(line)
-        for line in file
-        if line.strip()
-    ]
+# --------------------------------------------------
+# 4. Define metrics
+# --------------------------------------------------
 
-
-# 4. Create DeepEval test cases
-questions_tests = []
-
-for i, result in enumerate(results, start=1):
-
-    print(f"\nPreparing test {i}/{len(results)}")
-
-    context = result["context"]
-
-    if isinstance(context, str):
-        retrieval_context = [context]
-    else:
-        retrieval_context = context or []
-
-    test_case = LLMTestCase(
-        input=result["question"],
-        actual_output=result["actual_answer"],
-        expected_output=result["expected_answer"],
-        retrieval_context=retrieval_context
-    )
-
-    questions_tests.append(test_case)
-
-
-# 5. Configure all four metrics with Groq
 answer_relevancy = AnswerRelevancyMetric(
-    threshold=0.7,
-    model=evaluation_model
+    model=groq_eval_model,
+    async_mode=False,
 )
 
 faithfulness = FaithfulnessMetric(
-    threshold=0.7,
-    model=evaluation_model
+    model=groq_eval_model,
+    async_mode=False,
 )
 
 context_relevancy = ContextualRelevancyMetric(
-    threshold=0.7,
-    model=evaluation_model
+    model=groq_eval_model,
+    async_mode=False,
 )
 
 correctness = GEval(
     name="Correctness",
     criteria=(
-        "Determine whether the actual output is factually "
-        "correct based on the expected output. Penalize "
-        "contradictions and unsupported factual claims."
+        "Evaluate whether the actual answer accurately answers "
+        "the question compared with the expected answer. Penalize "
+        "factual errors, contradictions, and missing important "
+        "information."
     ),
     evaluation_params=[
-        SingleTurnParams.ACTUAL_OUTPUT,
-        SingleTurnParams.EXPECTED_OUTPUT
+        LLMTestCaseParams.INPUT,
+        LLMTestCaseParams.ACTUAL_OUTPUT,
+        LLMTestCaseParams.EXPECTED_OUTPUT,
     ],
-    threshold=0.7,
-    model=evaluation_model
+    model=groq_eval_model,
+    async_mode=False,
 )
 
+metrics = [
+    answer_relevancy,
+    faithfulness
+    
+]
 
-# 6. Run batch evaluation
-evaluation_results = evaluate(
-    test_cases=questions_tests,
-    metrics=[
-        answer_relevancy,
-        faithfulness,
-        context_relevancy,
-        correctness
-    ],
-    cache_config=CacheConfig(
-        use_cache=False,
-        write_cache=False
+
+# --------------------------------------------------
+# 5. Load input JSONL
+# --------------------------------------------------
+
+records = []
+
+with INPUT_FILE.open("r", encoding="utf-8") as file:
+    for line_number, line in enumerate(file, start=1):
+        if not line.strip():
+            continue
+
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Invalid JSON on line {line_number}: {exc}"
+            ) from exc
+
+        required_fields = [
+            "question",
+            "actual_answer",
+            "expected_answer",
+            "context",
+        ]
+
+        missing = [
+            field for field in required_fields
+            if field not in record
+        ]
+
+        if missing:
+            raise ValueError(
+                f"Line {line_number} is missing fields: {missing}"
+            )
+
+        records.append(record)
+
+if not records:
+    raise ValueError(f"No records found in {INPUT_FILE}")
+
+print(f"Loaded {len(records)} test cases.")
+
+
+# --------------------------------------------------
+# 6. Build DeepEval test cases
+# --------------------------------------------------
+
+test_cases = []
+
+for record in records:
+    context = record["context"]
+
+    if isinstance(context, str):
+        retrieval_context = [context]
+    elif isinstance(context, list):
+        retrieval_context = context
+    else:
+        raise ValueError(
+            "Each record's context must be a string or list."
+        )
+
+    test_cases.append(
+        LLMTestCase(
+            input=record["question"],
+            actual_output=record["actual_answer"],
+            expected_output=record["expected_answer"],
+            retrieval_context=retrieval_context,
+        )
     )
-)
 
 
-# 7. Extract scores
-evaluated_results = []
+# --------------------------------------------------
+# 7. Evaluate in batches and save completed results
+# --------------------------------------------------
 
-for original_result, test_result in zip(
-    results, evaluation_results.test_results
-):
+# Start a fresh output file for this run.
+OUTPUT_FILE.write_text("", encoding="utf-8")
 
-    scores = {
-        "answer_relevancy": None,
-        "faithfulness": None,
-        "context_relevancy": None,
-        "correctness": None
-    }
+completed = 0
+total = len(test_cases)
 
-    print(f"\nQuestion: {original_result['question']}")
+for start in range(0, total, BATCH_SIZE):
+    end = min(start + BATCH_SIZE, total)
 
-    for metric in test_result.metrics_data or []:
+    batch_records = records[start:end]
+    batch_cases = test_cases[start:end]
 
-        metric_name = metric.name.strip().lower()
+    print(
+        f"\nEvaluating test cases {start + 1}-{end} "
+        f"of {total}..."
+    )
 
-        if metric_name == "answer relevancy":
-            scores["answer_relevancy"] = metric.score
+    try:
+        evaluation_results = evaluate(
+            test_cases=batch_cases,
+            metrics=metrics,
+            cache_config=CacheConfig(
+                use_cache=False,
+                write_cache=False,
+            ),
+        )
 
-        elif metric_name == "faithfulness":
-            scores["faithfulness"] = metric.score
+        batch_output = []
 
-        elif metric_name == "contextual relevancy":
-            scores["context_relevancy"] = metric.score
+        for index, test_result in enumerate(
+            evaluation_results.test_results
+        ):
+            result_record = dict(batch_records[index])
+            scores = {}
 
-        elif metric_name == "correctness":
-            scores["correctness"] = metric.score
+            for metric_result in test_result.metrics_data:
+                scores[metric_result.name] = {
+                    "score": metric_result.score,
+                    "success": metric_result.success,
+                    "reason": metric_result.reason,
+                }
+
+            result_record["evaluation_scores"] = scores
+            batch_output.append(result_record)
+
+        # Append only after the entire batch succeeds.
+        with OUTPUT_FILE.open("a", encoding="utf-8") as output_file:
+            for result_record in batch_output:
+                output_file.write(
+                    json.dumps(
+                        result_record,
+                        ensure_ascii=False,
+                    ) + "\n"
+                )
+
+        completed += len(batch_output)
 
         print(
-            f"{metric.name}: {metric.score} | "
-            f"Passed: {metric.success}"
+            f"Saved {completed}/{total} test cases "
+            f"to {OUTPUT_FILE}"
         )
 
-    evaluated_result = {
-        **original_result,
-        **scores
-    }
-
-    evaluated_results.append(evaluated_result)
-
-
-# 8. Save the evaluated results
-with open(
-    "evaluated_results1.jsonl",
-    "w",
-    encoding="utf-8"
-) as file:
-
-    for result in evaluated_results:
-        file.write(
-            json.dumps(result, ensure_ascii=False) + "\n"
+    except Exception as exc:
+        print(
+            f"\nBatch starting at test case {start + 1} failed."
         )
+        print(f"{type(exc).__name__}: {exc}")
+        print(
+            f"Previously completed results remain in "
+            f"{OUTPUT_FILE.resolve()}"
+        )
+        raise
 
-print(
-    f"\nDone! Evaluated {len(evaluated_results)} test cases."
-)
-print("Results saved to evaluated_results1.jsonl")
+print("\nEvaluation completed successfully.")
+print(f"Total evaluated: {completed}")
+print(f"Output file: {OUTPUT_FILE.resolve()}")
