@@ -3,9 +3,9 @@ from langchain.agents import create_agent
 from langchain.messages import HumanMessage
 from langchain_groq import ChatGroq
 
-import tools as t1
-from tools import collecting_info
-from prompts import system_agent_prompt
+import RAG1.tools as t1
+from RAG1.tools import collecting_info
+from RAG1.prompts import system_agent_prompt
 
 llm = ChatGroq(
     model="openai/gpt-oss-120b",

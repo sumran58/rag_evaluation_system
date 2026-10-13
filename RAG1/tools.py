@@ -1,4 +1,4 @@
-from indexing import vector_store
+from RAG1.indexing import vector_store
 from langchain.tools import tool
 
 last_retrieved_context=[]
